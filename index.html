@@ -1,0 +1,724 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="mobile-web-app-capable" content="yes" />
+<title>Stock Trigger Tracker</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; background: #12151B; }
+  input:focus { outline: 2px solid #4FB8D6; outline-offset: 1px; }
+  button:focus-visible { outline: 2px solid #4FB8D6; outline-offset: 2px; }
+  ::placeholder { color: #4B5361; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useCallback } = React;
+
+/* ── DESIGN TOKENS ────────────────────────────────────────────── */
+const C = {
+  bg: "#12151B", panel: "#1A1F28", panelHi: "#20262F", border: "#2A313D",
+  ink: "#E7E9EE", mute: "#7C8494", faint: "#4B5361",
+  dormant: "#454B58", amber: "#E0A83C", red: "#C1453A", green: "#4F9E72",
+  violet: "#9456C4", cyan: "#4FB8D6",
+};
+const STORAGE_KEY = "stock-tracker-v2";
+const DEFAULT_WATCHLIST = ["STX", "WDC", "MU", "SNDK"];
+const RUNG_COUNT = 5;
+const STEP_DEFAULT = 0.15;
+
+const OUTCOME_ACTIONS = {
+  beatRaise: { label: "Beat + guidance raised", note: "Hold — reset System 1/2 levels; re-evaluate re-rating clause." },
+  beatFlat: { label: "Beat + guidance flat/cautious", note: "Sell 10% — beat already priced in, guidance is the signal." },
+  missUnchanged: { label: "Miss + guidance unchanged", note: "Sell 25% — deterioration, not yet thesis-breaking." },
+  missCut: { label: "Miss + guidance cut", note: "Sell 40–50% — thesis may be at risk. Trigger System 4 review." },
+};
+
+const CHECKLIST = {
+  cat1: { title: "Category 1 — Thesis Invalidation", items: [
+    "A substitute product/technology reaches commercial-scale adoption",
+    "Lost a top customer relationship to a competitor or in-house solution",
+    "Core technology roadmap proves unscalable or suffers a major failure",
+    "Primary competitive moat (cost, IP, capacity) has been closed by a rival",
+  ]},
+  cat2: { title: "Category 2 — Company-Specific Distress", items: [
+    "CEO/CFO replaced under adverse circumstances",
+    "SEC investigation or material accounting restatement",
+    "Debt covenant breach or downgrade to junk",
+    "Mass recall or systematic failure rate above norms",
+  ]},
+  cat3: { title: "Category 3 — Fundamental Deterioration (2-quarter rule)", items: [
+    "Revenue growth negative YoY for 2 consecutive quarters",
+    "Gross margin down 8+ points from peak, 2 consecutive quarters",
+    "Core market share declining, 2 consecutive quarters",
+    "End-market demand (customer capex) declining, 2 consecutive quarters",
+  ]},
+  cat4: { title: "Category 4 — Valuation Extreme", items: [
+    "Trailing P/E > 120× with no growth acceleration beyond 20%",
+    "Trailing P/E > 150× regardless of growth rate",
+  ]},
+  cat5: { title: "Category 5 — Income Concentration Risk", items: [
+    "Credible signal that your own employment at this company is at risk",
+  ]},
+};
+
+/* ── INDICATOR MATH ───────────────────────────────────────────── */
+function sma(closes, period) {
+  const n = Math.min(period, closes.length);
+  const slice = closes.slice(-n);
+  return slice.reduce((a, b) => a + b, 0) / n;
+}
+function rsiWilder(closes, period = 14) {
+  if (closes.length < period + 1) return null;
+  let gains = 0, losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff >= 0) gains += diff; else losses += -diff;
+  }
+  let avgGain = gains / period, avgLoss = losses / period;
+  for (let i = period + 1; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    const gain = diff > 0 ? diff : 0;
+    const loss = diff < 0 ? -diff : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+  }
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - 100 / (1 + rs);
+}
+function ema(values, period) {
+  const k = 2 / (period + 1);
+  const out = [values[0]];
+  for (let i = 1; i < values.length; i++) out.push(values[i] * k + out[i - 1] * (1 - k));
+  return out;
+}
+function macd(closes, fast = 12, slow = 26, signal = 9) {
+  const emaFast = ema(closes, fast);
+  const emaSlow = ema(closes, slow);
+  const macdLine = closes.map((_, i) => emaFast[i] - emaSlow[i]);
+  const signalLine = ema(macdLine, signal);
+  return { macdLine, signalLine };
+}
+function isoWeekKey(dateStr) {
+  const d = new Date(dateStr + "T00:00:00");
+  const day = (d.getDay() + 6) % 7;
+  d.setDate(d.getDate() - day + 3);
+  const firstThursday = new Date(d.getFullYear(), 0, 4);
+  const fdDay = (firstThursday.getDay() + 6) % 7;
+  firstThursday.setDate(firstThursday.getDate() - fdDay + 3);
+  const weekNo = 1 + Math.round((d - firstThursday) / (7 * 86400000));
+  return `${d.getFullYear()}-W${String(weekNo).padStart(2, "0")}`;
+}
+function resampleWeeklyCompleted(bars) {
+  const currentWeek = isoWeekKey(bars[bars.length - 1].date);
+  const weeks = {};
+  for (const b of bars) {
+    const k = isoWeekKey(b.date);
+    if (k === currentWeek) continue;
+    weeks[k] = b;
+  }
+  return Object.keys(weeks).sort().map((k) => weeks[k]);
+}
+
+async function fetchAndCompute(symbol, apiKey) {
+  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=1day&outputsize=260&apikey=${encodeURIComponent(apiKey)}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  if (data.status === "error" || !data.values) {
+    throw new Error(data.message || `No data returned for "${symbol}". Check the symbol and your API key.`);
+  }
+  const bars = data.values
+    .map((v) => ({ date: v.datetime, open: parseFloat(v.open), high: parseFloat(v.high), low: parseFloat(v.low), close: parseFloat(v.close), volume: parseFloat(v.volume) }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+
+  if (bars.length < 55) throw new Error("Not enough history returned to compute reliable indicators yet.");
+
+  const closes = bars.map((b) => b.close);
+  const yearHigh = Math.max(...bars.map((b) => b.high));
+
+  let weeklyMacdBearish = false;
+  const weeklyBars = resampleWeeklyCompleted(bars);
+  if (weeklyBars.length >= 35) {
+    const { macdLine, signalLine } = macd(weeklyBars.map((b) => b.close));
+    const i = macdLine.length - 1;
+    weeklyMacdBearish = macdLine[i] < signalLine[i];
+  }
+
+  // Backfill ~3 weeks of trading days so Path 3's streak and the dual-confirmation
+  // window are accurate from the very first fetch, not just from today onward.
+  // Each day is computed using only data available up to that day — no lookahead.
+  const BACKFILL_DAYS = 15;
+  const startIdx = Math.max(49, bars.length - BACKFILL_DAYS);
+  const entries = [];
+  for (let i = startIdx; i < bars.length; i++) {
+    const closesUpToI = closes.slice(0, i + 1);
+    const sma50_i = sma(closesUpToI, 50);
+    const sma20_i = sma(closesUpToI, 20);
+    const windowStart = Math.max(0, i - 19);
+    const vol20_i = bars.slice(windowStart, i + 1).reduce((a, b) => a + b.volume, 0) / (i + 1 - windowStart);
+    const volAbove_i = bars[i].volume > vol20_i;
+    const rsi_i = rsiWilder(closesUpToI, 14);
+    entries.push({
+      date: bars[i].date,
+      price: Math.round(bars[i].close * 100) / 100,
+      sma50: Math.round(sma50_i * 100) / 100,
+      sma20: Math.round(sma20_i * 100) / 100,
+      volume: volAbove_i ? "above" : "below",
+      rsi: rsi_i !== null ? Math.round(rsi_i * 10) / 10 : null,
+      weeklyMacdBearish,
+      sellPct: 0,
+    });
+  }
+
+  return { entries, yearHigh: Math.round(yearHigh * 100) / 100 };
+}
+
+// Best-effort only — Twelve Data's earnings endpoint may be paywalled on some
+// plans, or the response shape may differ from what's expected here. Any
+// failure just returns null, leaving the manually-set earnings date untouched.
+async function fetchEarningsDate(symbol, apiKey) {
+  try {
+    const url = `https://api.twelvedata.com/earnings?symbol=${encodeURIComponent(symbol)}&apikey=${encodeURIComponent(apiKey)}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!data || data.status === "error") return null;
+    const list = Array.isArray(data.earnings) ? data.earnings : Array.isArray(data) ? data : [];
+    const today = new Date().toISOString().slice(0, 10);
+    const dates = list.map((e) => e.date || e.datetime || e.report_date).filter(Boolean);
+    const future = dates.filter((d) => d >= today).sort();
+    return future.length > 0 ? future[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+/* ── System 2 path logic ──────────────────────────────────────── */
+function computeDerived(entries) {
+  const sorted = [...entries].sort((a, b) => a.date.localeCompare(b.date));
+  let path1Streak = 0, path3Streak = 0, ewStreak = 0;
+  let prevP1 = false, prevP3 = false, prevP2 = false;
+  const fires = [];
+
+  for (const e of sorted) {
+    const below = Number(e.price) < Number(e.sma50);
+    const below20 = e.sma20 != null ? Number(e.price) < Number(e.sma20) : false;
+    const volAbove = e.volume === "above";
+
+    ewStreak = below20 ? ewStreak + 1 : 0;
+
+    path1Streak = below && volAbove ? path1Streak + 1 : 0;
+    const p1now = path1Streak >= 2;
+    if (p1now && !prevP1) fires.push({ path: 1, date: e.date });
+    prevP1 = p1now;
+
+    path3Streak = below ? path3Streak + 1 : 0;
+    const p3now = path3Streak >= 5;
+    if (p3now && !prevP3) fires.push({ path: 3, date: e.date });
+    prevP3 = p3now;
+
+    const p2now = !!e.weeklyMacdBearish;
+    if (p2now && !prevP2) fires.push({ path: 2, date: e.date });
+    prevP2 = p2now;
+  }
+
+  const latest = sorted[sorted.length - 1] || null;
+  let dual = null;
+  for (let i = 0; i < fires.length; i++)
+    for (let j = i + 1; j < fires.length; j++)
+      if (fires[j].path !== fires[i].path) {
+        const days = Math.abs((new Date(fires[j].date) - new Date(fires[i].date)) / 86400000);
+        if (days <= 21) dual = [fires[i], fires[j]];
+      }
+
+  const trailing10 = sorted.slice(-10);
+  const cumSellPct = trailing10.reduce((s, e) => s + (Number(e.sellPct) || 0), 0);
+
+  return { sorted, latest, path1Streak, path3Streak, ewStreak, path2Active: prevP2, fires, dual, cumSellPct };
+}
+
+function computeReentry(entries, fires, manualConfirmed) {
+  if (!fires || fires.length === 0) return { relevant: false };
+  const sorted = [...entries].sort((a, b) => a.date.localeCompare(b.date));
+  const lastFireDate = fires[fires.length - 1].date;
+  const since = sorted.filter((e) => e.date >= lastFireDate);
+
+  let hadDip = false;
+  for (const e of since) if (e.rsi != null && e.rsi < 45) hadDip = true;
+
+  const last = since[since.length - 1];
+  const prev = since[since.length - 2];
+  const turnedUp = !!(last && prev && last.rsi != null && prev.rsi != null && last.rsi > prev.rsi);
+  const rsiCondition = hadDip && turnedUp;
+  const smaReclaim = !!(last && Number(last.price) > Number(last.sma50) && last.volume === "above");
+
+  return { relevant: true, rsiCondition, smaReclaim, manualConfirmed, allMet: rsiCondition && smaReclaim && manualConfirmed };
+}
+
+/* ── UI atoms (icons replaced with unicode — no icon-library dependency) ── */
+function StateLight({ state }) {
+  const color = { dormant: C.dormant, building: C.amber, triggered: C.red, positive: C.green }[state];
+  return <span style={{ display: "inline-block", width: 9, height: 9, borderRadius: 999, background: color, boxShadow: state === "triggered" ? `0 0 8px ${color}` : "none", flexShrink: 0 }} />;
+}
+function Tally({ count, total }) {
+  return (
+    <div style={{ display: "flex", gap: 4 }}>
+      {Array.from({ length: total }).map((_, i) => (
+        <div key={i} style={{ width: 14, height: 8, borderRadius: 2, background: i < count ? (count >= total ? C.red : C.amber) : C.dormant }} />
+      ))}
+    </div>
+  );
+}
+function Panel({ children, style }) {
+  return <div style={{ background: C.panel, border: `1px solid ${C.border}`, borderRadius: 8, padding: 16, ...style }}>{children}</div>;
+}
+function Label({ children }) {
+  return <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 10.5, letterSpacing: "0.06em", textTransform: "uppercase", color: C.mute, marginBottom: 6 }}>{children}</div>;
+}
+function NumInput({ value, onChange, placeholder }) {
+  return (
+    <input type="number" inputMode="decimal" value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder}
+      style={{ width: "100%", background: C.panelHi, border: `1px solid ${C.border}`, borderRadius: 6, padding: "8px 10px", color: C.ink, fontFamily: "'IBM Plex Mono', monospace", fontSize: 14, outline: "none" }} />
+  );
+}
+function TextInput({ value, onChange, placeholder, onEnter }) {
+  return (
+    <input type="text" autoCapitalize="none" autoCorrect="off" spellCheck={false} value={value} onChange={(e) => onChange(e.target.value)}
+      onKeyDown={(e) => e.key === "Enter" && onEnter && onEnter()} placeholder={placeholder}
+      style={{ width: "100%", background: C.panelHi, border: `1px solid ${C.border}`, borderRadius: 6, padding: "8px 10px", color: C.ink, fontFamily: "'IBM Plex Mono', monospace", fontSize: 14, outline: "none" }} />
+  );
+}
+function Toggle({ value, onChange, onLabel, offLabel }) {
+  return (
+    <div style={{ display: "flex", borderRadius: 6, overflow: "hidden", border: `1px solid ${C.border}`, background: C.bg }}>
+      <button onClick={() => onChange(false)} style={{ flex: 1, padding: "8px 10px", fontSize: 12.5, fontWeight: 600, border: "none", cursor: "pointer", background: !value ? C.panelHi : "transparent", color: !value ? C.ink : C.faint }}>{offLabel}</button>
+      <button onClick={() => onChange(true)} style={{ flex: 1, padding: "8px 10px", fontSize: 12.5, fontWeight: 600, border: "none", cursor: "pointer", background: value ? C.amber : "transparent", color: value ? "#1A1306" : C.faint }}>{onLabel}</button>
+    </div>
+  );
+}
+function Collapsible({ title, defaultOpen, children }) {
+  const [open, setOpen] = useState(!!defaultOpen);
+  return (
+    <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 10, marginTop: 10 }}>
+      <button onClick={() => setOpen(!open)} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%", background: "none", border: "none", cursor: "pointer", padding: 0, color: C.ink, fontSize: 13.5, fontWeight: 600 }}>
+        {title}
+        <span style={{ color: C.mute, fontSize: 11 }}>{open ? "▲" : "▼"}</span>
+      </button>
+      {open && <div style={{ marginTop: 10 }}>{children}</div>}
+    </div>
+  );
+}
+function StatusPill({ label, state }) {
+  const bg = { dormant: "rgba(69,75,88,0.25)", building: "rgba(224,168,60,0.18)", triggered: "rgba(193,69,58,0.18)", positive: "rgba(79,158,114,0.18)" }[state];
+  const fg = { dormant: C.mute, building: C.amber, triggered: C.red, positive: C.green }[state];
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 5, background: bg, borderRadius: 999, padding: "4px 9px" }}>
+      <StateLight state={state} />
+      <span style={{ fontSize: 10.5, fontWeight: 700, color: fg }}>{label}</span>
+    </div>
+  );
+}
+
+/* ── MAIN ─────────────────────────────────────────────────────── */
+function StockTracker() {
+  const [apiKey, setApiKey] = useState("");
+  const [apiKeyInput, setApiKeyInput] = useState("");
+  const [watchlist, setWatchlist] = useState(DEFAULT_WATCHLIST);
+  const [activeSymbol, setActiveSymbol] = useState("STX");
+  const [bySymbol, setBySymbol] = useState({});
+  const [addSymbolInput, setAddSymbolInput] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const [fetching, setFetching] = useState(false);
+  const [fetchError, setFetchError] = useState("");
+  const [lastUrl, setLastUrl] = useState("");
+  const [lastFetched, setLastFetched] = useState(null);
+  const [manualMode, setManualMode] = useState(false);
+  const [manualForm, setManualForm] = useState({ price: "", sma50: "", volume: "below", rsi: "", weeklyMacdBearish: false });
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const p = JSON.parse(raw);
+        setApiKey(p.apiKey || "");
+        setWatchlist(p.watchlist || DEFAULT_WATCHLIST);
+        setActiveSymbol(p.activeSymbol || "STX");
+        setBySymbol(p.bySymbol || {});
+      }
+    } catch { /* first run, nothing stored yet */ }
+    setLoaded(true);
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ apiKey, watchlist, activeSymbol, bySymbol }));
+    } catch { /* storage unavailable — non-fatal */ }
+  }, [apiKey, watchlist, activeSymbol, bySymbol, loaded]);
+
+  const sym = bySymbol[activeSymbol] || { entries: [], anchor: null, step: STEP_DEFAULT, earningsDate: "", earningsOutcome: null, checklist: {}, reentryConfirmed: false };
+
+  const updateSym = useCallback((patch) => {
+    setBySymbol((prev) => ({ ...prev, [activeSymbol]: { ...(prev[activeSymbol] || sym), ...patch } }));
+  }, [activeSymbol, sym]);
+
+  const runFetch = useCallback(async (symbol) => {
+    if (!apiKey) return;
+    setFetching(true);
+    setFetchError("");
+    try {
+      const [{ entries: fetchedEntries, yearHigh }, autoEarnings] = await Promise.all([
+        fetchAndCompute(symbol, apiKey),
+        fetchEarningsDate(symbol, apiKey),
+      ]);
+      setBySymbol((prev) => {
+        const cur = prev[symbol] || { entries: [], anchor: null, step: STEP_DEFAULT, earningsDate: "", earningsOutcome: null, checklist: {}, reentryConfirmed: false };
+        const fetchedDates = new Set(fetchedEntries.map((e) => e.date));
+        const keptOld = cur.entries.filter((e) => !fetchedDates.has(e.date));
+        const merged = [...keptOld, ...fetchedEntries].sort((a, b) => a.date.localeCompare(b.date));
+        return {
+          ...prev,
+          [symbol]: {
+            ...cur,
+            entries: merged,
+            anchor: cur.anchor ?? yearHigh,
+            earningsDate: cur.earningsDate || autoEarnings || "",
+          },
+        };
+      });
+      setLastFetched(new Date().toLocaleTimeString());
+    } catch (err) {
+      const raw = (err && err.message) || "";
+      const networkLevel = /load failed|failed to fetch|network/i.test(raw);
+      setFetchError(networkLevel ? "Could not reach Twelve Data — check your internet connection, or the key may be invalid/rate-limited." : raw || "Fetch failed — check your API key, the symbol, or try manual mode below.");
+      setLastUrl(`https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=1day&outputsize=260&apikey=${encodeURIComponent(apiKey)}`);
+    }
+    setFetching(false);
+  }, [apiKey]);
+
+  useEffect(() => {
+    if (loaded && apiKey && activeSymbol) runFetch(activeSymbol);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded, activeSymbol, apiKey]);
+
+  const derived = useMemo(() => computeDerived(sym.entries), [sym.entries]);
+
+  const rungs = useMemo(() => {
+    const anchor = sym.anchor || 0;
+    const step = sym.step || STEP_DEFAULT;
+    return Array.from({ length: RUNG_COUNT }, (_, i) => Math.round(anchor * Math.pow(1 + step, i)));
+  }, [sym.anchor, sym.step]);
+
+  const daysToEarnings = sym.earningsDate ? Math.round((new Date(sym.earningsDate) - new Date()) / 86400000) : null;
+  const flaggedCount = Object.values(sym.checklist || {}).filter(Boolean).length;
+
+  const reentry = useMemo(() => computeReentry(sym.entries, derived.fires, !!sym.reentryConfirmed), [sym.entries, derived.fires, sym.reentryConfirmed]);
+  const reentryBlocked = flaggedCount > 0;
+  const reentryFinal = reentry.relevant && reentry.allMet && !reentryBlocked;
+  const toggleReentryConfirm = () => updateSym({ reentryConfirmed: !sym.reentryConfirmed });
+
+  const p1state = derived.path1Streak >= 2 ? "triggered" : derived.path1Streak > 0 ? "building" : "dormant";
+  const p3state = derived.path3Streak >= 5 ? "triggered" : derived.path3Streak > 0 ? "building" : "dormant";
+  const p2state = derived.path2Active ? "triggered" : "dormant";
+  const sys2Overall = derived.dual ? "triggered" : [p1state, p2state, p3state].includes("triggered") ? "triggered" : [p1state, p2state, p3state].includes("building") ? "building" : "positive";
+  const sys3Overall = daysToEarnings !== null && daysToEarnings <= 3 && daysToEarnings >= 0 ? "building" : "dormant";
+  const sys4Overall = flaggedCount > 0 ? "triggered" : "dormant";
+  const nextRungIdx = rungs.findIndex((r) => derived.latest && r > derived.latest.price);
+  const sys1Overall = nextRungIdx === 0 && derived.latest && derived.latest.price / rungs[0] > 0.95 ? "building" : "dormant";
+  const latestBelow = derived.latest && sym.anchor ? Number(derived.latest.price) < Number(derived.latest.sma50) : null;
+
+  const saveApiKey = () => { setApiKey(apiKeyInput.trim()); setApiKeyInput(""); };
+  const addSymbol = () => {
+    const s = addSymbolInput.trim().toUpperCase();
+    if (!s || watchlist.includes(s)) return;
+    setWatchlist((prev) => [...prev, s]);
+    setAddSymbolInput("");
+    setActiveSymbol(s);
+  };
+  const removeSymbol = (s) => {
+    setWatchlist((prev) => prev.filter((x) => x !== s));
+    if (activeSymbol === s && watchlist.length > 1) setActiveSymbol(watchlist.find((x) => x !== s));
+  };
+  const saveManualEntry = () => {
+    if (!manualForm.price || !manualForm.sma50) return;
+    const today = new Date().toISOString().slice(0, 10);
+    const entry = { date: today, price: parseFloat(manualForm.price), sma50: parseFloat(manualForm.sma50), volume: manualForm.volume, rsi: manualForm.rsi ? parseFloat(manualForm.rsi) : null, weeklyMacdBearish: !!manualForm.weeklyMacdBearish, sellPct: 0 };
+    const others = (sym.entries || []).filter((e) => e.date !== today);
+    updateSym({ entries: [...others, entry], anchor: sym.anchor ?? entry.price });
+  };
+  const toggleCheck = (cat, idx) => {
+    const key = `${cat}-${idx}`;
+    updateSym({ checklist: { ...(sym.checklist || {}), [key]: !(sym.checklist || {})[key] } });
+  };
+
+  return (
+    <div style={{ background: C.bg, minHeight: "100vh", color: C.ink, fontFamily: "'IBM Plex Sans', sans-serif", padding: "20px 14px 60px" }}>
+      <div style={{ maxWidth: 480, margin: "0 auto" }}>
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 10.5, color: C.cyan, letterSpacing: "0.08em", marginBottom: 3 }}>MULTI-STOCK · TRIGGER TRACKER</div>
+          <div style={{ fontSize: 21, fontWeight: 700 }}>Control Panel</div>
+          <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 5 }}><StateLight state="dormant" /> <span style={{ fontSize: 10.5, color: C.mute }}>Dormant</span></div>
+            <div style={{ display: "flex", alignItems: "center", gap: 5 }}><StateLight state="building" /> <span style={{ fontSize: 10.5, color: C.mute }}>Building</span></div>
+            <div style={{ display: "flex", alignItems: "center", gap: 5 }}><StateLight state="triggered" /> <span style={{ fontSize: 10.5, color: C.mute }}>Act now</span></div>
+            <div style={{ display: "flex", alignItems: "center", gap: 5 }}><StateLight state="positive" /> <span style={{ fontSize: 10.5, color: C.mute }}>Healthy</span></div>
+          </div>
+        </div>
+
+        {!apiKey && (
+          <Panel style={{ marginBottom: 14, borderColor: C.cyan }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
+              <span style={{ fontSize: 15 }}>🔑</span>
+              <div style={{ fontSize: 13.5, fontWeight: 700 }}>Connect a free data feed</div>
+            </div>
+            <div style={{ fontSize: 12, color: C.mute, marginBottom: 10, lineHeight: 1.5 }}>
+              Get a free API key at twelvedata.com (no card needed), then paste it here. It's stored only in this page's local storage on your device.
+            </div>
+            <div style={{ display: "flex", gap: 6 }}>
+              <div style={{ flex: 1 }}><TextInput value={apiKeyInput} onChange={setApiKeyInput} placeholder="Paste API key" onEnter={saveApiKey} /></div>
+              <button onClick={saveApiKey} style={{ background: C.cyan, color: "#0B1A1E", border: "none", borderRadius: 6, padding: "0 14px", fontWeight: 700, cursor: "pointer" }}>Save</button>
+            </div>
+            <button onClick={() => setManualMode(true)} style={{ marginTop: 10, background: "none", border: "none", color: C.mute, fontSize: 11.5, textDecoration: "underline", cursor: "pointer", padding: 0 }}>Skip — I'll enter readings manually instead</button>
+          </Panel>
+        )}
+
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
+          {watchlist.map((s) => (
+            <button key={s} onClick={() => setActiveSymbol(s)} style={{ display: "flex", alignItems: "center", gap: 6, background: s === activeSymbol ? C.cyan : C.panel, color: s === activeSymbol ? "#0B1A1E" : C.ink, border: `1px solid ${s === activeSymbol ? C.cyan : C.border}`, borderRadius: 999, padding: "6px 10px", fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}>
+              {s}
+              <span onClick={(e) => { e.stopPropagation(); removeSymbol(s); }} style={{ opacity: 0.6, fontSize: 12, lineHeight: 1 }}>✕</span>
+            </button>
+          ))}
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <input value={addSymbolInput} onChange={(e) => setAddSymbolInput(e.target.value.toUpperCase())} onKeyDown={(e) => e.key === "Enter" && addSymbol()} placeholder="Add symbol"
+              style={{ width: 82, background: C.panelHi, border: `1px solid ${C.border}`, borderRadius: 999, padding: "6px 10px", color: C.ink, fontSize: 12, outline: "none" }} />
+            <button onClick={addSymbol} style={{ background: C.panelHi, border: `1px solid ${C.border}`, borderRadius: 999, width: 26, height: 26, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}>
+              <span style={{ color: C.mute, fontSize: 15, lineHeight: 1 }}>+</span>
+            </button>
+          </div>
+        </div>
+
+        {apiKey && (
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, fontSize: 11.5, color: C.mute }}>
+            <span>{lastFetched ? `Updated ${lastFetched}` : "Not yet fetched"}</span>
+            <button onClick={() => runFetch(activeSymbol)} disabled={fetching} style={{ display: "flex", alignItems: "center", gap: 5, background: "none", border: `1px solid ${C.border}`, borderRadius: 6, padding: "5px 10px", color: C.ink, cursor: "pointer", fontSize: 11.5 }}>
+              <span style={{ display: "inline-block", animation: fetching ? "spin 1s linear infinite" : "none" }}>↻</span>
+              {fetching ? "Fetching…" : "Refresh"}
+            </button>
+          </div>
+        )}
+        {fetchError && (
+          <div style={{ background: "rgba(193,69,58,0.12)", border: `1px solid ${C.red}`, borderRadius: 6, padding: "10px 12px", fontSize: 12, marginBottom: 12 }}>
+            <div style={{ marginBottom: 8 }}>{fetchError}</div>
+            {lastUrl && (
+              <div style={{ marginBottom: 8 }}>
+                <div style={{ fontSize: 10.5, color: C.mute, marginBottom: 3 }}>Diagnostic link (tap to select, copy into Safari to test directly):</div>
+                <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, color: C.ink, background: C.bg, borderRadius: 4, padding: "6px 8px", wordBreak: "break-all", userSelect: "all" }}>{lastUrl}</div>
+              </div>
+            )}
+            <button onClick={() => setManualMode(true)} style={{ color: C.cyan, background: "none", border: "none", cursor: "pointer", textDecoration: "underline", padding: 0, fontSize: 12 }}>Switch to manual entry</button>
+          </div>
+        )}
+
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 14 }}>
+          <StatusPill label={`SYS 1 · ${activeSymbol}`} state={sys1Overall} />
+          <StatusPill label="SYS 2" state={sys2Overall} />
+          <StatusPill label="SYS 3" state={sys3Overall} />
+          <StatusPill label="SYS 4" state={sys4Overall} />
+        </div>
+
+        {(manualMode || !apiKey) && (
+          <Panel style={{ marginBottom: 14 }}>
+            <Label>Manual reading — {activeSymbol}</Label>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
+              <NumInput value={manualForm.price} onChange={(v) => setManualForm({ ...manualForm, price: v })} placeholder="Close price" />
+              <NumInput value={manualForm.sma50} onChange={(v) => setManualForm({ ...manualForm, sma50: v })} placeholder="50-day SMA" />
+            </div>
+            <div style={{ marginBottom: 8 }}>
+              <div style={{ fontSize: 11, color: C.mute, marginBottom: 4 }}>Volume vs 20-day average</div>
+              <Toggle value={manualForm.volume === "above"} onChange={(v) => setManualForm({ ...manualForm, volume: v ? "above" : "below" })} onLabel="Above" offLabel="Below" />
+            </div>
+            <div style={{ marginBottom: 8 }}>
+              <div style={{ fontSize: 11, color: C.mute, marginBottom: 4 }}>Weekly MACD bearish (confirmed Friday close)</div>
+              <Toggle value={manualForm.weeklyMacdBearish} onChange={(v) => setManualForm({ ...manualForm, weeklyMacdBearish: v })} onLabel="Yes" offLabel="No" />
+            </div>
+            <button onClick={saveManualEntry} style={{ width: "100%", background: C.cyan, color: "#0B1A1E", border: "none", borderRadius: 6, padding: "10px 0", fontWeight: 700, cursor: "pointer" }}>Save reading</button>
+          </Panel>
+        )}
+
+        <Panel style={{ marginBottom: 14 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+            <div style={{ fontSize: 15, fontWeight: 700 }}>System 1 — Profit Ladder</div>
+            <button onClick={() => derived.latest && updateSym({ anchor: derived.latest.price })} title="Reset anchor to current price" style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 6, padding: 6, cursor: "pointer", display: "flex" }}>
+              <span style={{ color: C.mute, fontSize: 13 }}>↺</span>
+            </button>
+          </div>
+          <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 11, color: C.mute, marginBottom: 4 }}>Anchor</div>
+              <NumInput value={sym.anchor || ""} onChange={(v) => updateSym({ anchor: parseFloat(v) || 0 })} placeholder="52-wk high" />
+            </div>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 11, color: C.mute, marginBottom: 4 }}>Step %</div>
+              <NumInput value={Math.round((sym.step ?? STEP_DEFAULT) * 100)} onChange={(v) => updateSym({ step: (parseFloat(v) || 0) / 100 })} />
+            </div>
+          </div>
+          {rungs.map((r, i) => {
+            const cur = derived.latest?.price;
+            const isNext = cur && r > cur && (i === 0 || rungs[i - 1] <= cur);
+            return (
+              <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "7px 10px", marginBottom: 4, borderRadius: 5, background: isNext ? "rgba(79,184,214,0.1)" : "transparent", border: isNext ? `1px solid ${C.cyan}` : "1px solid transparent" }}>
+                <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 13 }}>Rung {i + 1} · ${r.toLocaleString()}</span>
+                {isNext && <span style={{ fontSize: 10.5, color: C.cyan, fontWeight: 600 }}>NEXT</span>}
+              </div>
+            );
+          })}
+        </Panel>
+
+        <Panel style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 2 }}>System 2 — Protection Floor</div>
+          {derived.latest && (
+            <div style={{ fontSize: 12, color: C.mute, marginBottom: 8 }}>
+              {activeSymbol}: ${derived.latest.price} vs SMA ${derived.latest.sma50} — <span style={{ color: latestBelow ? C.red : C.green, fontWeight: 600 }}>{latestBelow ? "below trend" : "above trend"}</span>
+            </div>
+          )}
+          {derived.ewStreak >= 2 && (
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 12 }}>
+              <StateLight state="building" />
+              <span style={{ fontSize: 11.5, color: C.amber }}>Early warning — {derived.ewStreak} sessions below the 20-day SMA. No sale yet, tighten monitoring.</span>
+            </div>
+          )}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <StateLight state={p1state} />
+              <div><div style={{ fontSize: 13, fontWeight: 600 }}>Path 1 · SMA + volume</div><div style={{ fontSize: 11, color: C.mute }}>{derived.path1Streak} of 2 days confirmed</div></div>
+            </div>
+            <Tally count={derived.path1Streak} total={2} />
+          </div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <StateLight state={p2state} />
+              <div><div style={{ fontSize: 13, fontWeight: 600 }}>Path 2 · Weekly MACD</div><div style={{ fontSize: 11, color: C.mute }}>{derived.path2Active ? "Bearish crossover confirmed" : "No confirmed crossover"}</div></div>
+            </div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <StateLight state={p3state} />
+              <div><div style={{ fontSize: 13, fontWeight: 600 }}>Path 3 · Persistence</div><div style={{ fontSize: 11, color: C.mute }}>{derived.path3Streak} of 5 sessions below SMA</div></div>
+            </div>
+            <Tally count={derived.path3Streak} total={5} />
+          </div>
+          {derived.dual && (
+            <div style={{ marginTop: 12, background: "rgba(193,69,58,0.12)", border: `1px solid ${C.red}`, borderRadius: 6, padding: "10px 12px", display: "flex", gap: 8 }}>
+              <span style={{ color: C.red, fontSize: 15, flexShrink: 0 }}>⚠</span>
+              <div style={{ fontSize: 12.5 }}><strong style={{ color: C.red }}>Dual confirmation —</strong> Path {derived.dual[0].path} and Path {derived.dual[1].path} both fired within 3 weeks. Sell 30%.</div>
+            </div>
+          )}
+          <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid ${C.border}`, fontSize: 11.5, color: C.mute }}>Rolling 10-entry sell total: <strong style={{ color: C.ink }}>{derived.cumSellPct}%</strong> of 35% cap</div>
+        </Panel>
+
+        {reentry.relevant && (
+          <Panel style={{ marginBottom: 14 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+              <div style={{ fontSize: 15, fontWeight: 700 }}>Re-Entry Signal</div>
+              <StatusPill label={reentryBlocked ? "Blocked by Sys 4" : reentryFinal ? "Confirmed" : "Not yet"} state={reentryBlocked ? "dormant" : reentryFinal ? "positive" : "building"} />
+            </div>
+            <div style={{ fontSize: 11.5, color: C.mute, marginBottom: 12 }}>After a sell, re-enter only on a confirmed reversal — never to catch a falling knife. All three conditions must hold at once.</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+              <StateLight state={reentry.rsiCondition ? "positive" : "dormant"} />
+              <span style={{ fontSize: 12.5, color: reentry.rsiCondition ? C.ink : C.mute }}>RSI dipped below 45, then turned back upward</span>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+              <StateLight state={reentry.smaReclaim ? "positive" : "dormant"} />
+              <span style={{ fontSize: 12.5, color: reentry.smaReclaim ? C.ink : C.mute }}>Price reclaimed the 50-day SMA on above-average volume</span>
+            </div>
+            <div onClick={toggleReentryConfirm} style={{ display: "flex", alignItems: "flex-start", gap: 8, padding: "8px 0 2px", cursor: "pointer", borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>
+              <div style={{ width: 15, height: 15, borderRadius: 3, border: `1.5px solid ${sym.reentryConfirmed ? C.green : C.border}`, background: sym.reentryConfirmed ? C.green : "transparent", flexShrink: 0, marginTop: 1 }} />
+              <span style={{ fontSize: 12.5, color: sym.reentryConfirmed ? C.ink : C.mute, lineHeight: 1.4 }}>I've confirmed no deterioration in the core demand/technology roadmap in the last 90 days</span>
+            </div>
+            {reentryBlocked && <div style={{ marginTop: 10, background: "rgba(148,86,196,0.12)", border: `1px solid ${C.violet}`, borderRadius: 6, padding: "8px 10px", fontSize: 11.5, color: C.violet }}>System 4 has flagged items — re-entry needs a fresh fundamental assessment, not just a technical reversal.</div>}
+            {!reentryBlocked && reentryFinal && <div style={{ marginTop: 10, background: "rgba(79,158,114,0.12)", border: `1px solid ${C.green}`, borderRadius: 6, padding: "8px 10px", fontSize: 11.5, color: C.green }}>All three conditions met — re-entry confirmed.</div>}
+          </Panel>
+        )}
+
+        <Panel style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 10 }}>System 3 — Earnings Discipline</div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 4 }}>
+            <input type="date" value={sym.earningsDate || ""} onChange={(e) => updateSym({ earningsDate: e.target.value })}
+              style={{ background: C.panelHi, border: `1px solid ${C.border}`, borderRadius: 6, padding: "8px 10px", color: C.ink, fontFamily: "'IBM Plex Mono', monospace", fontSize: 13 }} />
+            <div style={{ fontSize: 12.5, color: daysToEarnings !== null && daysToEarnings <= 3 && daysToEarnings >= 0 ? C.amber : C.mute, fontWeight: 600 }}>
+              {daysToEarnings === null ? "Set a date" : daysToEarnings > 0 ? `${daysToEarnings} days away` : daysToEarnings === 0 ? "Today" : "Passed — log outcome"}
+            </div>
+          </div>
+          <div style={{ fontSize: 10.5, color: C.faint, marginBottom: 10 }}>Auto-filled where the data feed provides it — always worth double-checking against the company's own investor relations page.</div>
+          {daysToEarnings !== null && daysToEarnings <= 0 && !sym.earningsOutcome && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+              {Object.entries(OUTCOME_ACTIONS).map(([key, o]) => (
+                <button key={key} onClick={() => updateSym({ earningsOutcome: key })} style={{ background: C.panelHi, border: `1px solid ${C.border}`, borderRadius: 6, padding: 8, fontSize: 11, color: C.ink, cursor: "pointer", textAlign: "left" }}>{o.label}</button>
+              ))}
+            </div>
+          )}
+          {sym.earningsOutcome && (
+            <div style={{ background: C.panelHi, borderRadius: 6, padding: "10px 12px", fontSize: 12.5 }}>
+              <div style={{ fontWeight: 600, marginBottom: 3 }}>{OUTCOME_ACTIONS[sym.earningsOutcome].label}</div>
+              <div style={{ color: C.mute }}>{OUTCOME_ACTIONS[sym.earningsOutcome].note}</div>
+              <button onClick={() => { const next = new Date(sym.earningsDate); next.setMonth(next.getMonth() + 3); updateSym({ earningsOutcome: null, earningsDate: next.toISOString().slice(0, 10) }); }}
+                style={{ marginTop: 8, background: "none", border: "none", color: C.cyan, fontSize: 11.5, cursor: "pointer", padding: 0 }}>Set next quarter's date →</button>
+            </div>
+          )}
+        </Panel>
+
+        <Panel style={{ marginBottom: 14 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div style={{ fontSize: 15, fontWeight: 700 }}>System 4 — Full Exit Protocol</div>
+            <StatusPill label={`${flaggedCount} flagged`} state={flaggedCount > 0 ? "triggered" : "dormant"} />
+          </div>
+          {Object.entries(CHECKLIST).map(([cat, data]) => (
+            <Collapsible key={cat} title={data.title}>
+              {data.items.map((item, idx) => {
+                const checked = !!(sym.checklist || {})[`${cat}-${idx}`];
+                return (
+                  <div key={idx} onClick={() => toggleCheck(cat, idx)} style={{ display: "flex", alignItems: "flex-start", gap: 8, padding: "6px 0", cursor: "pointer" }}>
+                    <div style={{ width: 15, height: 15, borderRadius: 3, border: `1.5px solid ${checked ? C.violet : C.border}`, background: checked ? C.violet : "transparent", flexShrink: 0, marginTop: 1 }} />
+                    <span style={{ fontSize: 12.5, color: checked ? C.ink : C.mute, lineHeight: 1.4 }}>{item}</span>
+                  </div>
+                );
+              })}
+            </Collapsible>
+          ))}
+        </Panel>
+
+        <Panel style={{ marginBottom: 14 }}>
+          <Collapsible title={`History — ${activeSymbol} (${(sym.entries || []).length} entries)`}>
+            {[...(sym.entries || [])].sort((a, b) => b.date.localeCompare(a.date)).map((e, i) => (
+              <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, fontFamily: "'IBM Plex Mono', monospace", padding: "5px 0", borderBottom: `1px solid ${C.border}`, color: C.mute }}>
+                <span>{e.date}</span>
+                <span>${e.price} / sma ${e.sma50} / vol {e.volume}</span>
+              </div>
+            ))}
+          </Collapsible>
+        </Panel>
+
+        <div style={{ fontSize: 10.5, color: C.faint, lineHeight: 1.6, padding: "0 4px" }}>
+          Live data via Twelve Data, fetched directly from your browser using your own API key, stored only on this device. Not financial advice.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<StockTracker />);
+</script>
+</body>
+</html>
