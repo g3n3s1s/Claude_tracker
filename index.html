@@ -196,6 +196,25 @@ async function fetchAndCompute(symbol, apiKey) {
     macdSignalVal = signalLine[i];
   }
 
+  // Provisional reading — includes the current, still-forming week using its most
+  // recent daily close as a stand-in. This is what a live TradingView weekly chart
+  // shows you mid-week, and it can differ from (and reverse before) the confirmed
+  // reading above. Surfacing both makes that discrepancy visible instead of
+  // looking like a bug.
+  let weeklyMacdBearishProvisional = weeklyMacdBearish;
+  let macdLineProvisional = macdLineVal;
+  let macdSignalProvisional = macdSignalVal;
+  const weeksAll = {};
+  for (const b of bars) weeksAll[isoWeekKey(b.date)] = b;
+  const weeklyBarsAll = Object.keys(weeksAll).sort().map((k) => weeksAll[k]);
+  if (weeklyBarsAll.length >= 35) {
+    const { macdLine, signalLine } = macd(weeklyBarsAll.map((b) => b.close));
+    const i = macdLine.length - 1;
+    weeklyMacdBearishProvisional = macdLine[i] < signalLine[i];
+    macdLineProvisional = macdLine[i];
+    macdSignalProvisional = signalLine[i];
+  }
+
   // Backfill ~3 weeks of trading days so Path 3's streak and the dual-confirmation
   // window are accurate from the very first fetch, not just from today onward.
   // Each day is computed using only data available up to that day — no lookahead.
@@ -222,6 +241,9 @@ async function fetchAndCompute(symbol, apiKey) {
       weeklyMacdBearish,
       macdLine: macdLineVal !== null ? Math.round(macdLineVal * 1000) / 1000 : null,
       macdSignal: macdSignalVal !== null ? Math.round(macdSignalVal * 1000) / 1000 : null,
+      macdLineProvisional: macdLineProvisional !== null ? Math.round(macdLineProvisional * 1000) / 1000 : null,
+      macdSignalProvisional: macdSignalProvisional !== null ? Math.round(macdSignalProvisional * 1000) / 1000 : null,
+      weeklyMacdBearishProvisional,
       sellPct: 0,
     });
   }
@@ -308,9 +330,15 @@ function computeReentry(entries, fires, manualConfirmed) {
 // pattern — a 15%+ pullback from a local high followed by a new high above the
 // last fired rung. A hard floor blocks any rung that would take remaining
 // position below 50% of the original share count.
-function computeLadderState(entries, anchor, step) {
+function computeLadderState(entries, anchor, step, resetDate) {
   const sorted = [...entries].sort((a, b) => a.date.localeCompare(b.date));
   if (!anchor) return { rungsFired: 0, dormant: false, batchNumber: 1, remainingPct: 100, floorBlocked: false };
+
+  // After a reset, the anchor represents a low point to rebuild from, not a high
+  // to reclaim — so the first rung due after a reset requires a genuine step-size
+  // climb (anchor × 1.15) rather than just being at/above the anchor itself,
+  // which any tiny uptick the very next day would otherwise trivially satisfy.
+  const rungOffset = resetDate ? 1 : 0;
 
   let rungsFired = 0;
   let dormant = false;
@@ -320,10 +348,12 @@ function computeLadderState(entries, anchor, step) {
 
   for (const e of sorted) {
     const price = Number(e.price);
-    const nextRungPrice = anchor * Math.pow(1 + step, rungsFired);
+    const eligibleForFiring = !resetDate || e.date > resetDate;
+    const effectiveIndex = eligibleForFiring ? rungsFired + rungOffset : rungsFired;
+    const nextRungPrice = anchor * Math.pow(1 + step, effectiveIndex);
     const remainingIfFired = Math.pow(0.92, rungsFired + 1) * 100;
 
-    if (!dormant && !floorBlocked && price >= nextRungPrice) {
+    if (eligibleForFiring && !dormant && !floorBlocked && price > nextRungPrice) {
       if (remainingIfFired < 50) {
         floorBlocked = true;
       } else {
@@ -516,15 +546,16 @@ function StockTracker() {
 
   const derived = useMemo(() => computeDerived(sym.entries, sym.anchor), [sym.entries, sym.anchor]);
 
-  const ladderState = useMemo(() => computeLadderState(sym.entries, sym.anchor, sym.step || STEP_DEFAULT), [sym.entries, sym.anchor, sym.step]);
+  const ladderState = useMemo(() => computeLadderState(sym.entries, sym.anchor, sym.step || STEP_DEFAULT, sym.lastAnchorReset), [sym.entries, sym.anchor, sym.step, sym.lastAnchorReset]);
   const mandatoryReview = useMemo(() => computeMandatoryReview(sym.entries, derived.fires, derived.dual), [sym.entries, derived.fires, derived.dual]);
 
   const rungs = useMemo(() => {
     const anchor = sym.anchor || 0;
     const step = sym.step || STEP_DEFAULT;
+    const offset = sym.lastAnchorReset ? 1 : 0;
     const count = Math.max(RUNG_COUNT, ladderState.rungsFired + 5);
-    return Array.from({ length: count }, (_, i) => Math.round(anchor * Math.pow(1 + step, i)));
-  }, [sym.anchor, sym.step, ladderState.rungsFired]);
+    return Array.from({ length: count }, (_, i) => Math.round(anchor * Math.pow(1 + step, i + offset)));
+  }, [sym.anchor, sym.step, sym.lastAnchorReset, ladderState.rungsFired]);
 
   const daysToEarnings = sym.earningsDate ? Math.round((new Date(sym.earningsDate) - new Date()) / 86400000) : null;
   const currentPE = sym.trailingEPS && derived.latest ? derived.latest.price / sym.trailingEPS : null;
@@ -537,11 +568,21 @@ function StockTracker() {
   const toggleReentryConfirm = () => updateSym({ reentryConfirmed: !sym.reentryConfirmed });
 
   const [sellLogInput, setSellLogInput] = useState("");
+  const [sellLogDate, setSellLogDate] = useState(new Date().toISOString().slice(0, 10));
   const logSell = () => {
     const pct = parseFloat(sellLogInput);
-    if (!pct || !derived.latest) return;
-    const today = derived.latest.date;
-    const updated = (sym.entries || []).map((e) => (e.date === today ? { ...e, sellPct: (Number(e.sellPct) || 0) + pct } : e));
+    if (!pct || !sellLogDate) return;
+    const existing = (sym.entries || []).find((e) => e.date === sellLogDate);
+    let updated;
+    if (existing) {
+      updated = sym.entries.map((e) => (e.date === sellLogDate ? { ...e, sellPct: (Number(e.sellPct) || 0) + pct } : e));
+    } else {
+      // No market-data entry for that date (outside the backfill window) — still
+      // record the sell so it counts toward the rolling cap, with a placeholder
+      // price so it doesn't break the path calculations.
+      const fallbackPrice = derived.latest ? derived.latest.price : 0;
+      updated = [...(sym.entries || []), { date: sellLogDate, price: fallbackPrice, sma50: fallbackPrice, volume: "below", rsi: null, weeklyMacdBearish: false, sellPct: pct }];
+    }
     updateSym({ entries: updated });
     setSellLogInput("");
   };
@@ -664,7 +705,7 @@ function StockTracker() {
         )}
 
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 14 }}>
-          <StatusPill label={`SYS 1 · ${activeSymbol}`} state={sys1Overall} />
+          <StatusPill label="SYS 1" state={sys1Overall} />
           <StatusPill label="SYS 2" state={sys2Overall} />
           <StatusPill label="SYS 3" state={sys3Overall} />
           <StatusPill label="SYS 4" state={sys4Overall} />
@@ -754,16 +795,23 @@ function StockTracker() {
             </div>
           )}
           {derived.latest && (
-            <div style={{ fontSize: 11, color: C.mute, marginBottom: 8, fontFamily: "'IBM Plex Mono', monospace" }}>
+            <div style={{ fontSize: 11, color: C.mute, marginBottom: 4, fontFamily: "'IBM Plex Mono', monospace" }}>
               Vol {fmtVol(derived.latest.volumeRaw)} vs avg {fmtVol(derived.latest.volumeAvg)}{" "}
               <span style={{ color: derived.latest.volume === "above" ? C.amber : C.mute, fontFamily: "'IBM Plex Sans', sans-serif" }}>
                 ({derived.latest.volume === "above" ? "above" : "below"})
               </span>
-              {derived.latest.macdLine != null && (
-                <>
-                  {" · "}MACD {derived.latest.macdLine} vs signal {derived.latest.macdSignal}
-                </>
-              )}{" "}
+            </div>
+            {derived.latest.macdLine != null && (
+              <div style={{ fontSize: 11, color: C.mute, marginBottom: 8, fontFamily: "'IBM Plex Mono', monospace" }}>
+                MACD confirmed (last closed week): {derived.latest.macdLine} vs signal {derived.latest.macdSignal}
+                <br />
+                MACD provisional (this week so far): {derived.latest.macdLineProvisional} vs signal {derived.latest.macdSignalProvisional}
+                {derived.latest.weeklyMacdBearishProvisional !== derived.latest.weeklyMacdBearish && (
+                  <span style={{ color: C.amber, fontFamily: "'IBM Plex Sans', sans-serif" }}> — differs from confirmed; this is likely what TradingView shows mid-week</span>
+                )}
+              </div>
+            )}
+            <div style={{ fontSize: 11, marginBottom: 8 }}>
               <span
                 onClick={() => {
                   setVolEditOpen(!volEditOpen);
@@ -797,20 +845,20 @@ function StockTracker() {
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <StateLight state={p1state} />
-              <div><div style={{ fontSize: 13, fontWeight: 600 }}>Path 1 · SMA + volume</div><div style={{ fontSize: 11, color: C.mute }}>{derived.path1Streak} of 2 days confirmed</div></div>
+              <div><div style={{ fontSize: 13, fontWeight: 600 }}>Path 1 · SMA + volume</div><div style={{ fontSize: 11, color: C.mute }}>{derived.path1Streak} of 2 days confirmed{p1state === "triggered" ? " — sell 10%" : ""}</div></div>
             </div>
             <Tally count={derived.path1Streak} total={2} />
           </div>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <StateLight state={p2state} />
-              <div><div style={{ fontSize: 13, fontWeight: 600 }}>Path 2 · Weekly MACD</div><div style={{ fontSize: 11, color: C.mute }}>{derived.path2Active ? "Bearish crossover confirmed" : "No confirmed crossover"}</div></div>
+              <div><div style={{ fontSize: 13, fontWeight: 600 }}>Path 2 · Weekly MACD</div><div style={{ fontSize: 11, color: C.mute }}>{derived.path2Active ? "Bearish crossover confirmed — sell 10%" : "No confirmed crossover"}</div></div>
             </div>
           </div>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
               <StateLight state={p3state} />
-              <div><div style={{ fontSize: 13, fontWeight: 600 }}>Path 3 · Persistence</div><div style={{ fontSize: 11, color: C.mute }}>{derived.path3Streak} of 5 sessions below SMA</div></div>
+              <div><div style={{ fontSize: 13, fontWeight: 600 }}>Path 3 · Persistence</div><div style={{ fontSize: 11, color: C.mute }}>{derived.path3Streak} of 5 sessions below SMA{p3state === "triggered" ? " — sell 10%" : ""}</div></div>
             </div>
             <Tally count={derived.path3Streak} total={5} />
           </div>
@@ -843,9 +891,15 @@ function StockTracker() {
           )}
           <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid ${C.border}` }}>
             <div style={{ fontSize: 11.5, color: C.mute, marginBottom: 8 }}>Rolling 10-entry sell total: <strong style={{ color: C.ink }}>{derived.cumSellPct}%</strong> of 35% cap</div>
-            <div style={{ fontSize: 10, color: C.faint, marginBottom: 6 }}>This only reflects sells you log below — the app shows you triggers, it doesn't assume you acted on them.</div>
+            <div style={{ fontSize: 10, color: C.faint, marginBottom: 6 }}>This only reflects sells you log below — the app shows you triggers, it doesn't assume you acted on them. Backdate it if you sold a few days ago.</div>
             <div style={{ display: "flex", gap: 6 }}>
-              <NumInput value={sellLogInput} onChange={setSellLogInput} placeholder="% actually sold today" />
+              <input
+                type="date"
+                value={sellLogDate}
+                onChange={(e) => setSellLogDate(e.target.value)}
+                style={{ background: C.panelHi, border: `1px solid ${C.border}`, borderRadius: 6, padding: "8px 10px", color: C.ink, fontFamily: "'IBM Plex Mono', monospace", fontSize: 13 }}
+              />
+              <NumInput value={sellLogInput} onChange={setSellLogInput} placeholder="% sold" />
               <button onClick={logSell} style={{ background: C.cyan, color: "#0B1A1E", border: "none", borderRadius: 6, padding: "0 14px", fontWeight: 700, cursor: "pointer", fontSize: 12.5 }}>Log</button>
             </div>
           </div>
@@ -946,7 +1000,10 @@ function StockTracker() {
             {[...(sym.entries || [])].sort((a, b) => b.date.localeCompare(a.date)).map((e, i) => (
               <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: 11.5, fontFamily: "'IBM Plex Mono', monospace", padding: "5px 0", borderBottom: `1px solid ${C.border}`, color: C.mute }}>
                 <span>{e.date}</span>
-                <span>${e.price} / sma ${e.sma50} / vol {fmtVol(e.volumeRaw)} ({fmtVol(e.volumeAvg)} avg)</span>
+                <span>
+                  ${e.price} / sma ${e.sma50} / vol {fmtVol(e.volumeRaw)} ({fmtVol(e.volumeAvg)} avg)
+                  {Number(e.sellPct) > 0 && <strong style={{ color: C.amber }}> · sold {e.sellPct}%</strong>}
+                </span>
               </div>
             ))}
           </Collapsible>
