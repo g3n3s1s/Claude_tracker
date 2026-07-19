@@ -158,11 +158,14 @@ function isoWeekKey(dateStr) {
   return `${d.getFullYear()}-W${String(weekNo).padStart(2, "0")}`;
 }
 function resampleWeeklyCompleted(bars) {
-  const currentWeek = isoWeekKey(bars[bars.length - 1].date);
+  const lastBar = bars[bars.length - 1];
+  const lastWeekday = new Date(lastBar.date + "T00:00:00").getDay(); // 5 = Friday
+  const currentWeek = isoWeekKey(lastBar.date);
+  const lastWeekIsFinished = lastWeekday === 5; // a Friday close means that trading week is actually done, not still forming
   const weeks = {};
   for (const b of bars) {
     const k = isoWeekKey(b.date);
-    if (k === currentWeek) continue;
+    if (k === currentWeek && !lastWeekIsFinished) continue;
     weeks[k] = b;
   }
   return Object.keys(weeks).sort().map((k) => weeks[k]);
