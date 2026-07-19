@@ -306,8 +306,20 @@ function computeDerived(entries, anchor) {
 
   const trailing10 = sorted.slice(-10);
   const cumSellPct = trailing10.reduce((s, e) => s + (Number(e.sellPct) || 0), 0);
+  // Build the visual rolling-window timeline: for each of the (up to) 10 days,
+  // how many more trading days until it rolls off the 10-day cap window, and
+  // whether a sell was logged on it. Day position is 1-indexed, oldest first.
+  const padding = 10 - trailing10.length;
+  const rollingWindow = trailing10.map((e, i) => ({
+    date: e.date,
+    price: e.price,
+    sellPct: Number(e.sellPct) || 0,
+    dayPosition: i + 1 + padding,
+    daysUntilRollOff: i + padding,
+  }));
+  const sellEvents = rollingWindow.filter((d) => d.sellPct > 0);
 
-  return { sorted, latest, path1Streak, path3Streak, ewStreak, path2Active: prevP2, p4Tier, p4Info: P4_TIERS.find((t) => t.tier === p4Tier) || null, fires, dual, cumSellPct };
+  return { sorted, latest, path1Streak, path3Streak, ewStreak, path2Active: prevP2, p4Tier, p4Info: P4_TIERS.find((t) => t.tier === p4Tier) || null, fires, dual, cumSellPct, rollingWindow, sellEvents };
 }
 
 function computeReentry(entries, fires, manualConfirmed) {
@@ -464,6 +476,53 @@ function StatusPill({ label, state }) {
     <div style={{ display: "flex", alignItems: "center", gap: 5, background: bg, borderRadius: 999, padding: "4px 9px" }}>
       <StateLight state={state} />
       <span style={{ fontSize: 10.5, fontWeight: 700, color: fg }}>{label}</span>
+    </div>
+  );
+}
+function RollingCapVisual({ rollingWindow, sellEvents, cumSellPct }) {
+  const padCount = 10 - rollingWindow.length;
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 3, marginBottom: 8 }}>
+        {Array.from({ length: padCount }).map((_, i) => (
+          <div key={`pad${i}`} style={{ flex: 1, height: 20, borderRadius: 3, background: "transparent", border: `1px dashed ${C.border}` }} title="No data yet" />
+        ))}
+        {rollingWindow.map((d) => {
+          const sold = d.sellPct > 0;
+          const intensity = Math.min(d.sellPct / 20, 1); // ramps color toward red as sell % rises
+          const bg = sold ? `rgba(193,69,58,${0.25 + intensity * 0.55})` : C.dormant;
+          return (
+            <div
+              key={d.date}
+              title={`Day ${d.dayPosition} of 10 (${d.date})${sold ? ` — sold ${d.sellPct}% at $${d.price}` : " — no sell"} · rolls off in ${d.daysUntilRollOff}d`}
+              style={{ flex: 1, height: 20, borderRadius: 3, background: bg, display: "flex", alignItems: "center", justifyContent: "center" }}
+            >
+              {sold && <span style={{ fontSize: 8, fontWeight: 700, color: "#fff" }}>{Math.round(d.sellPct)}</span>}
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: C.faint, marginBottom: 10 }}>
+        <span>10 days ago</span>
+        <span>Today</span>
+      </div>
+      {sellEvents.length > 0 && (
+        <div style={{ marginBottom: 4 }}>
+          {sellEvents.map((s, i) => (
+            <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: 10.5, padding: "5px 0", borderBottom: i < sellEvents.length - 1 ? `1px solid ${C.border}` : "none" }}>
+              <span style={{ color: C.ink }}>
+                Day {s.dayPosition} of 10 <span style={{ color: C.mute }}>({s.date})</span>
+              </span>
+              <span style={{ fontFamily: "'IBM Plex Mono', monospace", color: C.mute }}>
+                ${s.price} · <strong style={{ color: C.amber }}>{s.sellPct}%</strong> · rolls off in {s.daysUntilRollOff}d
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+      <div style={{ fontSize: 11.5, color: C.mute }}>
+        Total in window: <strong style={{ color: C.ink }}>{cumSellPct}%</strong> of 35% cap
+      </div>
     </div>
   );
 }
@@ -895,8 +954,9 @@ function StockTracker() {
             </div>
           )}
           <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid ${C.border}` }}>
-            <div style={{ fontSize: 11.5, color: C.mute, marginBottom: 8 }}>Rolling 10-entry sell total: <strong style={{ color: C.ink }}>{derived.cumSellPct}%</strong> of 35% cap</div>
-            <div style={{ fontSize: 10, color: C.faint, marginBottom: 6 }}>This only reflects sells you log below — the app shows you triggers, it doesn't assume you acted on them. Backdate it if you sold a few days ago.</div>
+            <div style={{ fontSize: 11, color: C.mute, marginBottom: 8, fontWeight: 600 }}>Rolling 10-day coordination cap</div>
+            <RollingCapVisual rollingWindow={derived.rollingWindow} sellEvents={derived.sellEvents} cumSellPct={derived.cumSellPct} />
+            <div style={{ fontSize: 10, color: C.faint, margin: "10px 0 6px" }}>This only reflects sells you log below — the app shows you triggers, it doesn't assume you acted on them. Backdate it if you sold a few days ago.</div>
             <div style={{ display: "flex", gap: 6 }}>
               <input
                 type="date"
@@ -935,7 +995,10 @@ function StockTracker() {
         )}
 
         <Panel style={{ marginBottom: 14 }}>
-          <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 10 }}>System 3 — Earnings Discipline</div>
+          <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 6 }}>System 3 — Earnings Discipline</div>
+          <div style={{ fontSize: 10.5, color: C.mute, marginBottom: 10 }}>
+            Shares the same rolling cap as System 2: <strong style={{ color: C.ink }}>{derived.cumSellPct}%</strong> of 35% used — full day-by-day breakdown in System 2 above.
+          </div>
           <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 4 }}>
             <input type="date" value={sym.earningsDate || ""} onChange={(e) => updateSym({ earningsDate: e.target.value })}
               style={{ background: C.panelHi, border: `1px solid ${C.border}`, borderRadius: 6, padding: "8px 10px", color: C.ink, fontFamily: "'IBM Plex Mono', monospace", fontSize: 13 }} />
