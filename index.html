@@ -795,6 +795,7 @@ function StockTracker() {
             </div>
           )}
           {derived.latest && (
+            <>
             <div style={{ fontSize: 11, color: C.mute, marginBottom: 4, fontFamily: "'IBM Plex Mono', monospace" }}>
               Vol {fmtVol(derived.latest.volumeRaw)} vs avg {fmtVol(derived.latest.volumeAvg)}{" "}
               <span style={{ color: derived.latest.volume === "above" ? C.amber : C.mute, fontFamily: "'IBM Plex Sans', sans-serif" }}>
@@ -823,6 +824,7 @@ function StockTracker() {
                 Correct
               </span>
             </div>
+            </>
           )}
           {volEditOpen && (
             <div style={{ background: C.panelHi, borderRadius: 6, padding: "10px 12px", marginBottom: 10 }}>
