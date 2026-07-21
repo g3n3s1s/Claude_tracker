@@ -171,6 +171,33 @@ function resampleWeeklyCompleted(bars) {
   return Object.keys(weeks).sort().map((k) => weeks[k]);
 }
 
+// Best-effort trailing EPS: sums the last 4 quarters of *actually reported*
+// EPS (not forward-looking estimates for unreported quarters) from Twelve
+// Data's earnings endpoint. This is a different, more trustworthy category of
+// data than the earnings-date calendar that turned out stale earlier — it's a
+// historical fact recorded once after each report, not a predicted future date
+// that needs ongoing maintenance. Still best-effort: returns null on anything
+// that doesn't look right, and never overwrites a value you've entered yourself.
+async function fetchTrailingEPS(symbol, apiKey) {
+  try {
+    const url = `https://api.twelvedata.com/earnings?symbol=${encodeURIComponent(symbol)}&apikey=${encodeURIComponent(apiKey)}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!data || data.status === "error") return null;
+    const list = Array.isArray(data.earnings) ? data.earnings : Array.isArray(data) ? data : [];
+    const today = new Date().toISOString().slice(0, 10);
+    const reported = list
+      .filter((e) => e.date && e.date < today && e.eps_actual != null && e.eps_actual !== "")
+      .sort((a, b) => b.date.localeCompare(a.date))
+      .slice(0, 4);
+    if (reported.length < 4) return null;
+    const ttmEPS = reported.reduce((sum, e) => sum + parseFloat(e.eps_actual), 0);
+    return ttmEPS > 0 ? Math.round(ttmEPS * 100) / 100 : null;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchAndCompute(symbol, apiKey) {
   const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=1day&outputsize=260&prepost=false&apikey=${encodeURIComponent(apiKey)}`;
   const res = await fetch(url);
@@ -575,7 +602,7 @@ function StockTracker() {
     } catch { /* storage unavailable — non-fatal */ }
   }, [apiKey, watchlist, activeSymbol, bySymbol, loaded]);
 
-  const sym = bySymbol[activeSymbol] || { entries: [], anchor: null, step: STEP_DEFAULT, earningsDate: "", earningsOutcome: null, checklist: {}, reentryConfirmed: false, trailingEPS: null, lastAnchorReset: null };
+  const sym = bySymbol[activeSymbol] || { entries: [], anchor: null, step: STEP_DEFAULT, earningsDate: "", earningsOutcome: null, checklist: {}, reentryConfirmed: false, trailingEPS: null, lastAnchorReset: null, trailingEPSSource: null };
 
   const updateSym = useCallback((patch) => {
     setBySymbol((prev) => ({ ...prev, [activeSymbol]: { ...(prev[activeSymbol] || sym), ...patch } }));
@@ -586,17 +613,31 @@ function StockTracker() {
     setFetching(true);
     setFetchError("");
     try {
-      const { entries: fetchedEntries, yearHigh } = await fetchAndCompute(symbol, apiKey);
+      const [{ entries: fetchedEntries, yearHigh }, autoEPS] = await Promise.all([
+        fetchAndCompute(symbol, apiKey),
+        fetchTrailingEPS(symbol, apiKey),
+      ]);
       setBySymbol((prev) => {
-        const cur = prev[symbol] || { entries: [], anchor: null, step: STEP_DEFAULT, earningsDate: "", earningsOutcome: null, checklist: {}, reentryConfirmed: false, trailingEPS: null, lastAnchorReset: null };
+        const cur = prev[symbol] || { entries: [], anchor: null, step: STEP_DEFAULT, earningsDate: "", earningsOutcome: null, checklist: {}, reentryConfirmed: false, trailingEPS: null, lastAnchorReset: null, trailingEPSSource: null };
         const fetchedDates = new Set(fetchedEntries.map((e) => e.date));
         const keptOld = cur.entries.filter((e) => !fetchedDates.has(e.date));
         const merged = [...keptOld, ...fetchedEntries].sort((a, b) => a.date.localeCompare(b.date));
         const latestPrice = merged.length ? merged[merged.length - 1].price : null;
         const { anchor: newAnchor, resetReason } = updateAnchor(cur.anchor, latestPrice, yearHigh);
+        // Never overwrite an EPS the user entered themselves — only fill it in
+        // if the field is genuinely empty, and remember it came from auto-fetch
+        // so the UI can flag it as unverified rather than presenting it as fact.
+        const epsUnset = cur.trailingEPS == null;
         return {
           ...prev,
-          [symbol]: { ...cur, entries: merged, anchor: newAnchor, lastAnchorReset: resetReason ? merged[merged.length - 1].date : cur.lastAnchorReset },
+          [symbol]: {
+            ...cur,
+            entries: merged,
+            anchor: newAnchor,
+            lastAnchorReset: resetReason ? merged[merged.length - 1].date : cur.lastAnchorReset,
+            trailingEPS: epsUnset && autoEPS ? autoEPS : cur.trailingEPS,
+            trailingEPSSource: epsUnset && autoEPS ? "auto" : cur.trailingEPSSource,
+          },
         };
       });
       setLastFetched(new Date().toLocaleTimeString());
@@ -1040,15 +1081,20 @@ function StockTracker() {
 
           <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 4 }}>
             <div style={{ flex: 1 }}>
-              <div style={{ fontSize: 11, color: C.mute, marginBottom: 4 }}>Trailing EPS</div>
-              <NumInput value={sym.trailingEPS || ""} onChange={(v) => updateSym({ trailingEPS: parseFloat(v) || null })} placeholder="e.g. 10.53" />
+              <div style={{ fontSize: 11, color: C.mute, marginBottom: 4 }}>
+                Trailing EPS{" "}
+                {sym.trailingEPSSource === "auto" && <span style={{ color: C.cyan, fontSize: 9.5 }}>(auto-fetched — verify)</span>}
+              </div>
+              <NumInput value={sym.trailingEPS || ""} onChange={(v) => updateSym({ trailingEPS: parseFloat(v) || null, trailingEPSSource: "manual" })} placeholder="e.g. 10.53" />
             </div>
             <div style={{ flex: 1, textAlign: "right" }}>
               <div style={{ fontSize: 11, color: C.mute, marginBottom: 4 }}>Live P/E</div>
               <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 16, fontWeight: 700, color: C.ink }}>{currentPE ? currentPE.toFixed(1) + "×" : "—"}</div>
             </div>
           </div>
-          <div style={{ fontSize: 10, color: C.faint, marginBottom: 10 }}>Computed from live price ÷ EPS — only the EPS needs updating, once a quarter after each report.</div>
+          <div style={{ fontSize: 10, color: C.faint, marginBottom: 10 }}>
+            Computed from live price ÷ EPS — only EPS needs updating, once a quarter. Auto-fetch sums the last 4 <em>actually reported</em> quarters from Twelve Data's earnings history — different data than the earnings-date calendar that was unreliable, but still worth a one-time check against the company's own filings before trusting it fully.
+          </div>
 
           {peTier && (
             <div style={{ background: C.panelHi, borderRadius: 6, padding: "8px 10px", marginBottom: 10, fontSize: 11.5 }}>
